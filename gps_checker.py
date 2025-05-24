@@ -240,7 +240,7 @@ def add_gps_to_image(image_path, lat, lon, alt=0.0, timestamp_dt=None):
         exif_dict = piexif.load(img.info.get('exif', b''))
         exif_dict['GPS'] = gps_ifd
         exif_bytes = piexif.dump(exif_dict)
-        img.save(image_path, exif=exif_bytes)
+        img.save(image_path, exif=exif_bytes, quality=100) # 设置JPEG保存质量为100
         ts_str = f" @ {timestamp_dt.strftime('%H:%M:%S')}" if timestamp_dt else ""
         print(
             f"\n[成功] 为 {os.path.basename(image_path)} 添加 GPS: ({lat:.6f}, {lon:.6f}){ts_str}"
