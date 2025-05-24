@@ -122,46 +122,93 @@ def _deg_to_dms_rational(deg_float):
 # == EXIF 数据处理函数
 # ============================================
 
-
 def get_exif_data(image_path):
-    """提取图片的 EXIF 数据"""
+    """提取图片的 EXIF 数据。优先使用 image.info['exif'] (通常为 bytes), 然后用 piexif 解析。
+       如果 image.info['exif'] 不可用，则尝试 image._getexif() (Pillow 的解析结果)。
+    """
     try:
         with Image.open(image_path) as image:
-            image.load()
-            return image._getexif()
+            image.load()  # Ensure image data is loaded
+
+            # 优先尝试从 image.info['exif'] 获取原始 EXIF 数据 (bytes)
+            # pillow-heif 插件会将 EXIF 数据放在这里
+            raw_exif_bytes = image.info.get('exif')
+            if raw_exif_bytes:
+                try:
+                    # piexif.load() 将 bytes 解析为标准的 EXIF 字典结构
+                    return piexif.load(raw_exif_bytes)
+                except Exception: # piexif.InvalidImageDataError or other piexif errors
+                    # If piexif parsing fails, try Pillow's internal method if available
+                    pass 
+
+            # 如果 image.info['exif'] 不可用或解析失败，尝试 Pillow 自带的 _getexif()
+            # 注意: HeifImageFile 对象没有 _getexif 方法，所以对于HIF文件，上面的路径理论上应成功
+            if hasattr(image, '_getexif'):
+                pil_exif_data = image._getexif() # Pillow 的 EXIF 解析结果，是一个平面字典 {tag_id: value}
+                if pil_exif_data:
+                    return pil_exif_data # 直接返回这个字典
+
+            return None # 如果两种方法都没有获取到 EXIF 数据
     except Exception as e:
-        print(f"\n[错误] 读取图片 {os.path.basename(image_path)} 时出错: {e}")
+        # 捕获 Image.open 或 image.load 可能发生的错误
+        print(f"\n[错误] 读取图片 {os.path.basename(image_path)} 的 EXIF 数据时出错: {e}")
         return None
 
 
 def get_gps_info(exif_data):
-    """从 EXIF 数据中提取 GPS 信息字典"""
+    """从 EXIF 数据中提取 GPS 信息字典。
+       可以处理 piexif.load() 的输出或 Pillow 的 _getexif() 输出。
+    """
     if not exif_data:
         return None
-    gps_info = {}
-    for tag_id, value in exif_data.items():
-        tag_name = TAGS.get(tag_id, tag_id)
-        if tag_name == 'GPSInfo':
-            for gps_tag_id, gps_value in value.items():
-                gps_tag_name = GPSTAGS.get(gps_tag_id, gps_tag_id)
-                gps_info[gps_tag_name] = gps_value
-            return gps_info
+    
+    gps_ifd_data = None
+
+    # 检查是否是 piexif.load() 的输出格式 (包含 'GPS' key)
+    if 'GPS' in exif_data and isinstance(exif_data['GPS'], dict):
+        gps_ifd_data = exif_data['GPS']
+    # 检查是否是 Pillow 的 _getexif() 输出格式 (包含 GPSInfo tag)
+    elif isinstance(exif_data, dict): # Ensure exif_data is a dict before iterating
+        for tag_id, value in exif_data.items():
+            tag_name = TAGS.get(tag_id, tag_id)
+            if tag_name == 'GPSInfo' and isinstance(value, dict):
+                gps_ifd_data = value
+                break
+    
+    if gps_ifd_data:
+        gps_info_dict = {}
+        for gps_tag_id, gps_value in gps_ifd_data.items():
+            gps_tag_name = GPSTAGS.get(gps_tag_id, gps_tag_id)
+            gps_info_dict[gps_tag_name] = gps_value
+        return gps_info_dict if gps_info_dict else None # Return None if dict is empty
+        
     return None
 
 
 def get_image_datetime(exif_data):
-    """从 EXIF 数据中获取拍摄时间 (返回本地时间对象)"""
+    """从 EXIF 数据中获取拍摄时间 (返回本地时间对象)
+       可以处理 piexif.load() 的输出或 Pillow 的 _getexif() 输出。
+    """
     if not exif_data:
         return None
-    try:
+    
+    date_time_str = None
+    # 检查 exif_data 是否是 piexif.load() 的输出格式 (结构化字典)
+    if isinstance(exif_data.get('Exif'), dict):
+        date_time_str = exif_data['Exif'].get(36867) # DateTimeOriginal from ExifIFD
+        if not date_time_str and isinstance(exif_data.get('0th'), dict):
+            date_time_str = exif_data['0th'].get(306) # DateTime from 0th IFD (ImageIFD)
+    # 否则，假设是 Pillow 的 _getexif() 输出格式 (扁平字典)
+    elif isinstance(exif_data, dict):
         date_time_str = exif_data.get(36867) or exif_data.get(306)
-        if date_time_str:
+
+    if date_time_str:
+        try:
             if isinstance(date_time_str, bytes):
                 date_time_str = date_time_str.decode('utf-8')
-            return datetime.strptime(date_time_str.strip(),
-                                     '%Y:%m:%d %H:%M:%S')
-    except (ValueError, TypeError, AttributeError) as e:
-        print(f"\n[警告] 解析时间戳时出错: {date_time_str} - {e}")
+            return datetime.strptime(date_time_str.strip(), '%Y:%m:%d %H:%M:%S')
+        except (ValueError, TypeError, AttributeError) as e:
+            print(f"\n[警告] 解析时间戳时出错: {date_time_str} - {e}")
     return None
 
 
