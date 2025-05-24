@@ -21,6 +21,7 @@ import csv
 import os
 import sys
 from datetime import datetime, timedelta
+import concurrent.futures # 添加 concurrent.futures 导入
 
 try:
     import piexif
@@ -43,7 +44,7 @@ except ImportError:
 
 # --- 全局常量 ---
 SUPPORTED_EXTENSIONS = ('.jpg', '.jpeg', '.tif', '.tiff', '.hif', '.heic')
-DEFAULT_TOLERANCE_SECONDS = 600
+DEFAULT_TOLERANCE_SECONDS = 300 # 默认时间匹配容差 (秒)
 
 # ============================================
 # == GPS 坐标转换函数
@@ -377,12 +378,78 @@ def find_closest_gps(image_dt, gps_log, max_tolerance_seconds):
 
 
 # ============================================
+# == 单个图片处理逻辑 (用于多进程)
+# ============================================
+
+def process_single_image(image_path, gps_log, overwrite_gps, time_tolerance, show_coords, move_nogps, nogps_folder_path):
+    filename = os.path.basename(image_path)
+    exif_data = get_exif_data(image_path)
+    gps_info_current = get_gps_info(exif_data)
+    has_gps = gps_info_current is not None
+    added_gps = False
+    moved_file = False
+
+    status_line = f"{filename}: "
+
+    # 尝试添加/覆盖 GPS
+    if gps_log and (not has_gps or overwrite_gps):
+        img_time = get_image_datetime(exif_data)
+        if img_time:
+            closest_data = find_closest_gps(img_time, gps_log, time_tolerance)
+            if closest_data:
+                if add_gps_to_image(image_path, closest_data['lat'],
+                                    closest_data['lon'],
+                                    closest_data['alt'],
+                                    closest_data['time']): # <--- 传递时间
+                    added_gps = True
+                    # 重新获取EXIF以反映更改
+                    exif_data = get_exif_data(image_path)
+                    gps_info_current = get_gps_info(exif_data)
+                    has_gps = True # 更新has_gps状态
+                else:
+                    status_line += "[添加失败]"
+            elif not has_gps: # 只有在原本就没有GPS，且找不到匹配时才标记
+                status_line += f"[无匹配GPS ({img_time.strftime('%H:%M:%S')})]"
+        elif not has_gps: # 只有在原本就没有GPS，且没有拍摄时间时才标记
+            status_line += "[无拍摄时间]"
+
+    # 最终状态判断与处理
+    if has_gps and gps_info_current:
+        status_line += "包含 GPS"
+        if show_coords:
+            lat, lon = convert_gps_to_decimal(gps_info_current)
+            if lat is not None and lon is not None:
+                status_line += f" ({lat:.6f}, {lon:.6f})"
+            else:
+                status_line += " (坐标解析失败)"
+    else:
+        if not any(x in status_line for x in ["[", "失败"]): # 避免重复添加状态
+            status_line += "无 GPS 信息"
+
+        if move_nogps and nogps_folder_path:
+            dest_path = os.path.join(nogps_folder_path, filename)
+            try:
+                # 在移动前确保目标文件夹存在 (多进程中可能需要再次检查)
+                os.makedirs(nogps_folder_path, exist_ok=True)
+                os.rename(image_path, dest_path)
+                status_line += " -> 已移动"
+                moved_file = True
+            except Exception as e:
+                # 注意：在多进程中，print可能不会按预期顺序显示，或者需要特殊处理
+                # 对于简单脚本，暂时保留，但大型应用可能需要日志队列
+                # print(f"\n[错误] 移动 {filename} 时出错: {e}")
+                status_line += f" -> 移动失败 ({e})"
+
+    return {'filename': filename, 'status': status_line.strip(), 'has_gps': has_gps, 'added': added_gps, 'moved': moved_file}
+
+
+# ============================================
 # == 主扫描与处理逻辑
 # ============================================
 
 
 def scan_images(folder_path, show_coords, output_file_path, move_nogps,
-                gps_csv_path, overwrite_gps, time_tolerance):
+                gps_csv_path, overwrite_gps, time_tolerance, num_workers=None):
     """主函数：扫描、检查并处理图片"""
 
     print("\n" + "=" * 40)
@@ -409,80 +476,35 @@ def scan_images(folder_path, show_coords, output_file_path, move_nogps,
 
     print(f"找到 {total} 张图片，开始处理...")
 
-    count_gps = 0
-    count_nogps_final = 0
-    count_added = 0
-    count_moved = 0
-    output_lines = []
+    # 如果 num_workers 未指定，则使用 CPU 核心数，至少为1
+    effective_num_workers = num_workers if num_workers is not None else (os.cpu_count() or 1)
+    print(f"使用 {effective_num_workers} 个工作进程进行处理...")
 
-    nogps_folder = None
-    if move_nogps:
-        nogps_folder = os.path.join(folder_path, "_nogps_")
-        os.makedirs(nogps_folder, exist_ok=True)
-        print(f"无 GPS 图片将被移动到: {nogps_folder}")
+    results = []
+    with concurrent.futures.ProcessPoolExecutor(max_workers=effective_num_workers) as executor:
+        futures = {
+            executor.submit(process_single_image, os.path.join(folder_path, filename),
+                            gps_log, overwrite_gps, time_tolerance, show_coords, move_nogps,
+                            os.path.join(folder_path, "_nogps_") if move_nogps else None):
+            filename
+            for filename in image_files
+        }
+        for i, future in enumerate(concurrent.futures.as_completed(futures)):
+            filename = futures[future]
+            progress = f"处理中: {i + 1}/{total} - {filename:<35}"
+            print(f"\r{progress}", end="", flush=True) # 使用 \r 实现行内更新
+            try:
+                result = future.result()
+                if result:
+                    results.append(result)
+            except Exception as e:
+                print(f"\n[错误] 处理 {filename} 时发生意外: {e}")
+                results.append({'filename': filename, 'status': '[处理失败]', 'has_gps': False, 'added': False, 'moved': False})
 
-    for i, filename in enumerate(image_files):
-        image_path = os.path.join(folder_path, filename)
-
-        progress = f"处理中: {i + 1}/{total} - {filename:<35}"
-        print(f"\r{progress}", end="", flush=True)
-
-        exif_data = get_exif_data(image_path)
-        gps_info_current = get_gps_info(exif_data)
-        has_gps = gps_info_current is not None
-
-        status_line = f"{filename}: "
-
-        # 尝试添加/覆盖 GPS
-        if gps_log and (not has_gps or overwrite_gps):
-            img_time = get_image_datetime(exif_data)
-            if img_time:
-                closest_data = find_closest_gps(img_time, gps_log,
-                                                time_tolerance)
-                if closest_data:
-                    if add_gps_to_image(image_path, closest_data['lat'],
-                                        closest_data['lon'],
-                                        closest_data['alt'],
-                                        closest_data['time']):  # <--- 传递时间
-                        count_added += 1
-                        exif_data = get_exif_data(image_path)
-                        gps_info_current = get_gps_info(exif_data)
-                        has_gps = True
-                    else:
-                        status_line += "[添加失败]"
-                elif not has_gps:
-                    status_line += f"[无匹配GPS ({img_time.strftime('%H:%M:%S')})]"
-            elif not has_gps:
-                status_line += "[无拍摄时间]"
-
-        # 最终状态判断与处理
-        if has_gps and gps_info_current:
-            count_gps += 1
-            status_line += "包含 GPS"
-            if show_coords:
-                lat, lon = convert_gps_to_decimal(gps_info_current)
-                if lat is not None and lon is not None:
-                    status_line += f" ({lat:.6f}, {lon:.6f})"
-                else:
-                    status_line += " (坐标解析失败)"
-        else:
-            if not any(x in status_line for x in ["[", "失败"]):
-                status_line += "无 GPS 信息"
-
-            if move_nogps and nogps_folder:
-                dest_path = os.path.join(nogps_folder, filename)
-                try:
-                    os.rename(image_path, dest_path)
-                    status_line += " -> 已移动"
-                    count_moved += 1
-                except Exception as e:
-                    print(f"\n[错误] 移动 {filename} 时出错: {e}")
-                    status_line += " -> 移动失败"
-            # else:
-            #      count_nogps_final += 1 # 这行计算逻辑有误，下面统一计算
-
-        output_lines.append(status_line.strip())
-
+    count_gps = sum(1 for r in results if r['has_gps'])
+    count_added = sum(1 for r in results if r['added'])
+    count_moved = sum(1 for r in results if r['moved'])
+    output_lines = [r['status'] for r in results]
     # 统一计算最终的无 GPS 数量
     count_nogps_final = total - count_gps
 
@@ -564,6 +586,11 @@ def setup_arg_parser():
                         "--version",
                         action="version",
                         version="%(prog)s 1.6")
+    parser.add_argument("--workers",
+                        type=int,
+                        default=None,
+                        help="用于处理图片的工作进程数 (默认: 自动确定, 通常为CPU核心数)。",
+                        metavar="N")
     return parser
 
 
@@ -600,6 +627,18 @@ def run_interactive_mode():
         except ValueError:
             print(f"   - [警告] 无效输入，将使用默认容差 {DEFAULT_TOLERANCE_SECONDS} 秒。")
 
+    num_workers_str = input(f"6. 输入处理工作进程数 (可选, 默认将使用CPU核心数): ").strip()
+    num_workers = None
+    if num_workers_str:
+        try:
+            num_workers = int(num_workers_str)
+            if num_workers <= 0:
+                print("   - [警告] 工作进程数必须为正整数，将使用默认值。")
+                num_workers = None
+        except ValueError:
+            print("   - [警告] 无效的工作进程数输入，将使用默认值。")
+            num_workers = None
+
     return {
         "folder": folder_path,
         "coordinates": show_coords,
@@ -608,6 +647,7 @@ def run_interactive_mode():
         "gps_file": gps_csv_path,
         "overwrite": overwrite_gps,
         "tolerance": time_tolerance,
+        "workers": num_workers,
     }
 
 
@@ -638,7 +678,7 @@ def main():
 
     try:
         scan_images(args.folder, args.coordinates, args.output, args.move,
-                    args.gps_file, args.overwrite, args.tolerance)
+                    args.gps_file, args.overwrite, args.tolerance, args.workers)
     except KeyboardInterrupt:
         print("\n\n[信息] 处理被用户中断。")
     except Exception as e:
