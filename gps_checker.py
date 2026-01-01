@@ -159,6 +159,7 @@ def get_exif_data(image_path):
 def get_gps_info(exif_data):
     """从 EXIF 数据中提取 GPS 信息字典。
        可以处理 piexif.load() 的输出或 Pillow 的 _getexif() 输出。
+       确保返回的GPS信息包含完整的经纬度坐标数据。
     """
     if not exif_data:
         return None
@@ -181,7 +182,16 @@ def get_gps_info(exif_data):
         for gps_tag_id, gps_value in gps_ifd_data.items():
             gps_tag_name = GPSTAGS.get(gps_tag_id, gps_tag_id)
             gps_info_dict[gps_tag_name] = gps_value
-        return gps_info_dict if gps_info_dict else None # Return None if dict is empty
+        
+        # 检查GPS字典是否包含必要的坐标数据
+        required_tags = ['GPSLatitude', 'GPSLatitudeRef', 'GPSLongitude', 'GPSLongitudeRef']
+        has_all_required = all(tag in gps_info_dict for tag in required_tags)
+        
+        if has_all_required:
+            return gps_info_dict
+        else:
+            # GPS字典不包含完整的坐标数据，返回None
+            return None
         
     return None
 

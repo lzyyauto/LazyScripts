@@ -1,0 +1,13 @@
+[project]
+name = "00-supershell"
+version = "0.1.0"
+requires-python = ">=3.10"
+dependencies = [
+    "exifread>=3.5.1",
+    "geopy>=2.4.1",
+    "numpy>=2.2.6",
+    "pillow>=12.0.0",
+    "pillow-heif>=1.1.1",
+    "reverse-geocoder>=1.5.1",
+    "tqdm>=4.67.1",
+]

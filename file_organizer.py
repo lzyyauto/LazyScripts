@@ -66,6 +66,35 @@ def organize_files_by_extension(directory):
     return True
 
 
+def compare_and_clean_by_reference(ref_dir, target_dir):
+    """
+    根据标本目录中的文件名，删除操作目录中不在标本目录中的文件
+    只比对文件名（不含扩展名），扩展名不限
+    """
+    if not os.path.isdir(ref_dir) or not os.path.isdir(target_dir):
+        print(f"错误: 标本目录或操作目录无效")
+        return False
+
+    # 获取标本目录下所有文件名（不含扩展名）
+    ref_names = set(
+        os.path.splitext(f)[0] for f in os.listdir(ref_dir)
+        if os.path.isfile(os.path.join(ref_dir, f)))
+
+    # 遍历操作目录，删除不在标本目录中的文件
+    for f in os.listdir(target_dir):
+        file_path = os.path.join(target_dir, f)
+        if not os.path.isfile(file_path):
+            continue
+        name, _ = os.path.splitext(f)
+        if name not in ref_names:
+            try:
+                os.remove(file_path)
+                print(f"已删除: {f}")
+            except Exception as e:
+                print(f"删除 {f} 时出错: {str(e)}")
+    return True
+
+
 def main():
     # 创建命令行参数解析器
     parser = argparse.ArgumentParser(
@@ -81,13 +110,27 @@ def main():
   - 扩展名不区分大小写（.jpg和.JPG都归类到JPG文件夹）
   - 没有扩展名的文件会放到NO_EXT文件夹中
   - 会自动创建以扩展名大写命名的文件夹
-        ''',
+
+新增功能:
+  --ref 标本目录 --target 操作目录
+    只保留操作目录中与标本目录同名（不含扩展名）的文件，其余全部删除
+    例如: python file_organizer.py --ref ~/keep_jpg --target ~/raw_dir
+''',
         formatter_class=argparse.RawDescriptionHelpFormatter)
 
     parser.add_argument('directory',
                         nargs='?',
                         default=os.getcwd(),
                         help='要整理的目录路径（默认为当前目录）')
+
+    parser.add_argument('--ref',
+                        '--reference',
+                        dest='ref_dir',
+                        help='标本目录，只保留操作目录中与标本目录同名（不含扩展名）的文件')
+    parser.add_argument('--target',
+                        '--operation',
+                        dest='target_dir',
+                        help='操作目录，将被筛选和删除文件')
 
     # 解析命令行参数
     args = parser.parse_args()
@@ -96,6 +139,14 @@ def main():
     # 如果使用了默认目录，提示用户
     if directory == os.getcwd() and len(sys.argv) == 1:
         print(f"未提供目录路径，将使用当前目录: {directory}")
+
+    if args.ref_dir and args.target_dir:
+        print(f"根据标本目录 {args.ref_dir} 清理操作目录 {args.target_dir}")
+        if compare_and_clean_by_reference(args.ref_dir, args.target_dir):
+            print("清理完成！")
+        else:
+            print("清理失败！")
+        return
 
     # 组织文件
     print(f"开始整理目录: {directory}")
